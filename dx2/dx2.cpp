@@ -138,18 +138,272 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 #endif
 
     //创建DXGI Factory对象
+    THROW_IF_FAILED(CreateDXGIFactory2(nDXGIFactoryFlags, IID_PPV_ARGS(&pIDXGIFactory5)));
+    THROW_IF_FAILED(pIDXGIFactory5->MakeWindowAssociation(hWnd, DXGI_MWA_NO_ALT_ENTER));
+
+    //枚举适配器，并选择合适的适配器来创建3D设备对象
+    DXGI_ADAPTER_DESC1 stAdapterDesc = {};
+    for (UINT adapterIndex = 0; pIDXGIFactory5->EnumAdapters1(adapterIndex, &pIAdapter1) != DXGI_ERROR_NOT_FOUND; adapterIndex++)
+    {
+        pIAdapter1->GetDesc1(&stAdapterDesc);
+        if (stAdapterDesc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+            continue;
+        if(SUCCEEDED(D3D12CreateDevice(pIAdapter1.Get(), emFeatureLevel, _uuidof(ID3D12Device), nullptr)))
+            break;
+    }
+    THROW_IF_FAILED(D3D12CreateDevice(pIAdapter1.Get(), emFeatureLevel, IID_PPV_ARGS(&pID3D12Device4)));
+
+    //显示被选择的显卡
+    TCHAR pszWndTitle[MAX_PATH] = {};
+    ::GetWindowText(hWnd, pszWndTitle, MAX_PATH);
+    StringCchPrintf(pszWndTitle, MAX_PATH, _T("%s (GPU:%s)"), pszWndTitle, stAdapterDesc.Description);
+    ::SetWindowText(hWnd, pszWndTitle);
+
+    //创建直接命令队列
+    D3D12_COMMAND_QUEUE_DESC stQueueDesc = {};
+    stQueueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    THROW_IF_FAILED(pID3D12Device4->CreateCommandQueue(&stQueueDesc, IID_PPV_ARGS(&pICMDQueue)));
+
+    //创建交换链
+    DXGI_SWAP_CHAIN_DESC1 stSwapChainDesc = {};
+    stSwapChainDesc.BufferCount = nFrameBackBufCount;
+    stSwapChainDesc.Width = iWidth;
+    stSwapChainDesc.Height = iHeight;
+    stSwapChainDesc.Format = emRenderTargetFormat;
+    stSwapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    stSwapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    stSwapChainDesc.SampleDesc.Count = 1;
+    THROW_IF_FAILED(pIDXGIFactory5->CreateSwapChainForHwnd(pICMDQueue.Get(), hWnd, &stSwapChainDesc, nullptr, nullptr, &pISwapChain1));
+    THROW_IF_FAILED(pISwapChain1.As(&pISwapChain3));
+    //得到当前后缓冲区的序号，也就是下一个将要呈送显示的缓冲区的序号
+    nFrameIndex = pISwapChain3->GetCurrentBackBufferIndex();
+
+    //创建RTV描述符堆
+    D3D12_DESCRIPTOR_HEAP_DESC stRTVHeapDesc = {};
+    stRTVHeapDesc.NumDescriptors = nFrameBackBufCount;
+    stRTVHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    stRTVHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    THROW_IF_FAILED(pID3D12Device4->CreateDescriptorHeap(&stRTVHeapDesc, IID_PPV_ARGS(&pIRTVHeap)));
+    nRTVDescriptorSize = pID3D12Device4->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    //创建RTV的描述符
+    D3D12_CPU_DESCRIPTOR_HANDLE stRTVHandle = pIRTVHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < nFrameBackBufCount; i++)
+    {
+        THROW_IF_FAILED(pISwapChain3->GetBuffer(i, IID_PPV_ARGS(&pIARenderTargets[i])));
+        pID3D12Device4->CreateRenderTargetView(pIARenderTargets[i].Get(), nullptr, stRTVHandle);
+        stRTVHandle.ptr += nRTVDescriptorSize;
+    }
+
+    //创建一个空的根描述符，也就是默认的根描述符
+    D3D12_ROOT_SIGNATURE_DESC stRootSignatureDesc = 
+    {
+        0,
+        nullptr,
+        0,
+        nullptr,
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
+    };
+    ComPtr<ID3DBlob> pISignatureBlob;
+    ComPtr<ID3DBlob> pIErrorBlob;
+    THROW_IF_FAILED(D3D12SerializeRootSignature(&stRootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1, &pISignatureBlob, &pIErrorBlob));
+    THROW_IF_FAILED(pID3D12Device4->CreateRootSignature(0, pISignatureBlob->GetBufferPointer(), pISignatureBlob->GetBufferSize(), IID_PPV_ARGS(&pIRootSignature)));
+
+    //创建命令列表分配器
+    THROW_IF_FAILED(pID3D12Device4->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&pICMDAlloc)));
+    //创建图形命令列表
+    THROW_IF_FAILED(pID3D12Device4->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, pICMDAlloc.Get(), pIPipelineState.Get(), IID_PPV_ARGS(&pICMDList)));
+
+    //编译shader创建渲染管线状态对象
+    ComPtr<ID3DBlob> pIBlobVertexShader;
+    ComPtr<ID3DBlob> pIBlobPixelShader;
+#if defined(_DEBUG)
+    //调试状态下，打开shader编译的调试标志，不优化
+    UINT nCompileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+    UINT nCompileFlags = 0;
+#endif
+    TCHAR pszShaderFileName[MAX_PATH] = {};
+    StringCchPrintf(pszShaderFileName, MAX_PATH, _T("%s\\shader\\shaders.hlsl"), pszAppPath);
+    THROW_IF_FAILED(D3DCompileFromFile(pszShaderFileName, nullptr, nullptr, "VSMain", "vs_5_0", nCompileFlags, 0, &pIBlobVertexShader, nullptr));
+    THROW_IF_FAILED(D3DCompileFromFile(pszShaderFileName, nullptr, nullptr, "PSMain", "ps_5_0", nCompileFlags, 0, &pIBlobPixelShader, nullptr));
+    D3D12_INPUT_ELEMENT_DESC stInputElementDescs[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+    };
+
+    //定义渲染管线状态描述结构，创建渲染管线对象
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC stPSODesc = {};
+    stPSODesc.InputLayout = { stInputElementDescs, _countof(stInputElementDescs) };
+    stPSODesc.pRootSignature = pIRootSignature.Get();
+    stPSODesc.VS.pShaderBytecode = pIBlobVertexShader->GetBufferPointer();
+    stPSODesc.VS.BytecodeLength = pIBlobVertexShader->GetBufferSize();
+    stPSODesc.PS.pShaderBytecode = pIBlobPixelShader->GetBufferPointer();
+    stPSODesc.PS.BytecodeLength = pIBlobPixelShader->GetBufferSize();
+    stPSODesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    stPSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    stPSODesc.BlendState.AlphaToCoverageEnable = FALSE;
+    stPSODesc.BlendState.IndependentBlendEnable = FALSE;
+    stPSODesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    stPSODesc.DepthStencilState.DepthEnable = FALSE;
+    stPSODesc.DepthStencilState.StencilEnable = FALSE;
+    stPSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    stPSODesc.NumRenderTargets = 1;
+    stPSODesc.RTVFormats[0] = emRenderTargetFormat;
+    stPSODesc.SampleMask = UINT_MAX;
+    stPSODesc.SampleDesc.Count = 1;
+    THROW_IF_FAILED(pID3D12Device4->CreateGraphicsPipelineState(&stPSODesc, IID_PPV_ARGS(&pIPipelineState)));
+
+    //创建顶点缓冲
+    GRS_VERTEX stTriangleVertices[] =
+    {
+        { { 0.0f, 0.25f * fTriangleSize, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
+        { {0.25f * fTriangleSize, -0.25f * fTriangleSize, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+        {{-0.25f * fTriangleSize, -0.25f * fTriangleSize, 0.0f, 1.0f}, {0.0f, 0.0f, 1.0f, 1.0f} }
+    };
+    const UINT nVertexBufferSize = sizeof(stTriangleVertices);
+
+    D3D12_HEAP_PROPERTIES stHeapProp = { D3D12_HEAP_TYPE_UPLOAD };
+    D3D12_RESOURCE_DESC stResDesc = {};
+    stResDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    stResDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    stResDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    stResDesc.Format = DXGI_FORMAT_UNKNOWN;
+    stResDesc.Width = nVertexBufferSize;
+    stResDesc.Height = 1;
+    stResDesc.DepthOrArraySize = 1;
+    stResDesc.MipLevels = 1;
+    stResDesc.SampleDesc.Count = 1;
+    stResDesc.SampleDesc.Quality = 0;
+    THROW_IF_FAILED(pID3D12Device4->CreateCommittedResource(&stHeapProp, D3D12_HEAP_FLAG_NONE, &stResDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&pIVertexBuffer)));
+
+    UINT8* pVertexDataBegin = nullptr;
+    D3D12_RANGE stReadRange = { 0, 0 };
+    THROW_IF_FAILED(pIVertexBuffer->Map(0, &stReadRange, reinterpret_cast<void**>(&pVertexDataBegin)));
+
+    memcpy(pVertexDataBegin, stTriangleVertices, sizeof(stTriangleVertices));
+
+    pIVertexBuffer->Unmap(0, nullptr);
+
+    stVertexBufferView.BufferLocation = pIVertexBuffer->GetGPUVirtualAddress();
+    stVertexBufferView.StrideInBytes = sizeof(GRS_VERTEX);
+    stVertexBufferView.SizeInBytes = nVertexBufferSize;
+
+    //创建围栏对象，用于等待渲染完成
+    THROW_IF_FAILED(pID3D12Device4->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pIFence)));
+    n64FenceValue = 1;
+
+    //创建一个event同步对象，用于等待围栏事件通知
+    hEventFence = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (hEventFence == nullptr) 
+    {
+        THROW_IF_FAILED(HRESULT_FROM_WIN32(GetLastError()));
+    }
+
+    //填充资源屏障结构
+    D3D12_RESOURCE_BARRIER stBeginResBarrier = {};
+    stBeginResBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    stBeginResBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    stBeginResBarrier.Transition.pResource = pIARenderTargets[nFrameIndex].Get();
+    stBeginResBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    stBeginResBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    stBeginResBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    D3D12_RESOURCE_BARRIER stEndResBarrier = {};
+    stEndResBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    stEndResBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    stEndResBarrier.Transition.pResource = pIARenderTargets[nFrameIndex].Get();
+    stEndResBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    stEndResBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    stEndResBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    stRTVHandle = pIRTVHeap->GetCPUDescriptorHandleForHeapStart();
+    DWORD dwRet = 0;
+    BOOL bExit = FALSE;
+
+    THROW_IF_FAILED(pICMDList->Close());
+    SetEvent(hEventFence);
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_DX2));
 
     MSG msg;
 
-    // 主消息循环:
-    while (GetMessage(&msg, nullptr, 0, 0))
+    // 开始消息循环，并被其中不断渲染
+    while (!bExit)
     {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        dwRet = ::MsgWaitForMultipleObjects(1, &hEventFence, FALSE, INFINITE, QS_ALLINPUT);
+        switch (dwRet - WAIT_OBJECT_0)
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+        case 0:
+        {
+            //获取新的后缓冲序号，因为present真正完成时后缓冲序号就更新了
+            nFrameIndex = pISwapChain3->GetCurrentBackBufferIndex();
+            //重置命令分配器
+            THROW_IF_FAILED(pICMDAlloc->Reset());
+            //重置命令列表
+            THROW_IF_FAILED(pICMDList->Reset(pICMDAlloc.Get(), pIPipelineState.Get()));
+
+            //开始记录命令
+            pICMDList->SetGraphicsRootSignature(pIRootSignature.Get());
+            pICMDList->SetPipelineState(pIPipelineState.Get());
+            pICMDList->RSSetViewports(1, &stViewPort);
+            pICMDList->RSSetScissorRects(1, &stScissorRect);
+
+            //通过资源屏障判断后缓冲已经切换完毕可以开始渲染了
+            stBeginResBarrier.Transition.pResource = pIARenderTargets[nFrameIndex].Get();
+            pICMDList->ResourceBarrier(1, &stBeginResBarrier);
+
+            //设置渲染目标
+            stRTVHandle = pIRTVHeap->GetCPUDescriptorHandleForHeapStart();
+            stRTVHandle.ptr += nFrameIndex * nRTVDescriptorSize;
+            pICMDList->OMSetRenderTargets(1, &stRTVHandle, FALSE, nullptr);
+
+            //继续记录命令，并真正开始新一帧的渲染
+            pICMDList->ClearRenderTargetView(stRTVHandle, faClearColor, 0, nullptr);
+            pICMDList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            pICMDList->IASetVertexBuffers(0, 1, &stVertexBufferView);
+
+            //绘制
+            pICMDList->DrawInstanced(3, 1, 0, 0);
+
+            //又一个资源屏障，用于确定渲染已经结束可以提交画面去显示了
+            stEndResBarrier.Transition.pResource = pIARenderTargets[nFrameIndex].Get();
+            pICMDList->ResourceBarrier(1, &stEndResBarrier);
+
+            //关闭命令列表，可以去执行了
+            THROW_IF_FAILED(pICMDList->Close());
+
+            //执行命令列表
+            ID3D12CommandList* ppCommandLists[] = { pICMDList.Get() };
+            pICMDQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+            //提交画面
+            THROW_IF_FAILED(pISwapChain3->Present(1, 0));
+
+            //开始同步CPU和GPU的执行，先记录围栏标记值
+            const UINT64 n64CurrentFenceValue = n64FenceValue;
+            THROW_IF_FAILED(pICMDQueue->Signal(pIFence.Get(), n64CurrentFenceValue));
+            n64FenceValue++;
+            THROW_IF_FAILED(pIFence->SetEventOnCompletion(n64CurrentFenceValue, hEventFence));
+        }
+            break;
+        case 1:
+            //处理消息
+            while (::PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+            {
+                if (WM_QUIT != msg.message)
+                {
+                    ::TranslateMessage(&msg);
+                    ::DispatchMessage(&msg);
+                }
+                else
+                {
+                    bExit = TRUE;
+                }
+            }
+            break;
+        default:
+            break;
         }
     }
 
@@ -198,7 +452,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow, HWND& hWnd)
 {
    hInst = hInstance; // 将实例句柄存储在全局变量中
 
-   hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPED,
+   hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPED | WS_SYSMENU,
       CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
 
    if (!hWnd)
